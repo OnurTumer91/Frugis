@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -44,6 +45,8 @@ def setup_quiet_mode(quiet: bool) -> None:
     warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
     warnings.filterwarnings("ignore", message=".*triton not found.*")
 
+    logging.getLogger().setLevel(logging.ERROR)
+
     for name in [
         "whisperx",
         "pyannote",
@@ -62,6 +65,22 @@ def setup_quiet_mode(quiet: bool) -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("PYTHONWARNINGS", "ignore")
+
+
+@contextlib.contextmanager
+def suppress_stderr(enabled: bool):
+    """Hard-silence noisy libs that dump to stderr (torchcodec/pyannote)."""
+    if not enabled:
+        yield
+        return
+    devnull = open(os.devnull, "w")
+    old_stderr = sys.stderr
+    try:
+        sys.stderr = devnull
+        yield
+    finally:
+        sys.stderr = old_stderr
+        devnull.close()
 
 
 # -----------------------------
@@ -149,10 +168,7 @@ def looks_like_url(s: str) -> bool:
 
 
 def download_youtube_with_progress(
-    url: str,
-    out_dir: Path,
-    ffmpeg_bin: str,
-    progress: Progress,
+    url: str, out_dir: Path, ffmpeg_bin: str, progress: Progress
 ) -> Path:
     try:
         import yt_dlp
@@ -214,10 +230,7 @@ def download_youtube_with_progress(
 # CLI prompts
 # -----------------------------
 def ask(prompt: str, default: Optional[str] = None) -> str:
-    if default is not None:
-        prompt = f"{prompt} [{default}]: "
-    else:
-        prompt = f"{prompt}: "
+    prompt = f"{prompt} [{default}]: " if default is not None else f"{prompt}: "
     s = input(prompt).strip().strip('"').strip("'")
     return s if s else (default or "")
 
@@ -236,10 +249,10 @@ def ask_lang_mode(existing: Optional[str]) -> str:
     if existing in ("auto", "tr", "en", "mix"):
         return existing
     console.print("🌍 Language mode?")
-    console.print("  [bold]tr[/bold] = Turkish only")
-    console.print("  [bold]en[/bold] = English only")
-    console.print("  [bold]mix[/bold] = mixed TR/EN (auto-detect)")
-    console.print("  [bold]auto[/bold] = auto-detect")
+    console.print("  tr   = Turkish only")
+    console.print("  en   = English only")
+    console.print("  mix  = mixed TR/EN (auto-detect)")
+    console.print("  auto = auto-detect")
     while True:
         s = ask("Choose", default="mix").lower()
         if s in ("auto", "tr", "en", "mix"):
@@ -255,15 +268,13 @@ def resolve_language(lang_mode: str) -> Optional[str]:
 
 
 # -----------------------------
-# Segment merging (same speaker)
+# Segment merging
 # -----------------------------
 def merge_consecutive_segments(
-    segments: List[Dict[str, Any]],
-    max_gap_s: float = 0.6,
+    segments: List[Dict[str, Any]], max_gap_s: float = 0.6
 ) -> List[Dict[str, Any]]:
     if not segments:
         return segments
-
     merged: List[Dict[str, Any]] = []
     cur = dict(segments[0])
 
@@ -291,7 +302,7 @@ def merge_consecutive_segments(
 
 
 # -----------------------------
-# SRT + TXT writing
+# SRT + TXT
 # -----------------------------
 def srt_ts(seconds: float) -> str:
     if seconds < 0:
@@ -389,7 +400,7 @@ def output_dir_for_input(input_path: Path) -> Path:
 
 
 # -----------------------------
-# LM Studio (OpenAI-compatible) client
+# LM Studio (JSON final only)
 # -----------------------------
 def lmstudio_is_up(base_url: str, timeout_s: float = 1.5) -> bool:
     try:
@@ -399,43 +410,27 @@ def lmstudio_is_up(base_url: str, timeout_s: float = 1.5) -> bool:
         return False
 
 
-def strip_reasoning(text: str) -> str:
-    """
-    Remove common chain-of-thought / reasoning blocks from some local models.
-    """
-    if not text:
-        return text
-
-    # Remove <think>...</think>
-    text = re.sub(
-        r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE
-    ).strip()
-
-    # Remove "Thinking Process:" or "Reasoning:" prefixed blocks if present
-    # (Conservative: if model outputs it, often it precedes the final answer.)
-    patterns = [
-        r"^Thinking Process:\s*.*?(?=\n\n|\Z)",
-        r"^Reasoning:\s*.*?(?=\n\n|\Z)",
-    ]
-    for pat in patterns:
-        text = re.sub(pat, "", text, flags=re.DOTALL | re.IGNORECASE).strip()
-
-    # If it still contains a huge analysis then "Final Answer:" later, keep only after it
-    m = re.search(r"(Final Answer:|Final:)\s*", text, flags=re.IGNORECASE)
-    if m:
-        text = text[m.end() :].strip()
-
-    return text.strip()
+def lmstudio_pick_model(base_url: str, preferred: str) -> str:
+    try:
+        r = requests.get(base_url.rstrip("/") + "/v1/models", timeout=3.0)
+        r.raise_for_status()
+        data = r.json()
+        ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        if not ids:
+            return preferred
+        return preferred if preferred in ids else ids[0]
+    except Exception:
+        return preferred
 
 
-def lmstudio_chat(
+def lmstudio_chat_raw(
     base_url: str,
     model: str,
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.2,
-    max_tokens: int = 1200,
-    timeout_s: float = 300.0,
+    max_tokens: int = 15000,
+    timeout_s: float = 900.0,
 ) -> str:
     url = base_url.rstrip("/") + "/v1/chat/completions"
     payload = {
@@ -450,135 +445,50 @@ def lmstudio_chat(
     r = requests.post(url, json=payload, timeout=timeout_s)
     r.raise_for_status()
     data = r.json()
-    out = (data["choices"][0]["message"]["content"] or "").strip()
-    return strip_reasoning(out)
+    return (data["choices"][0]["message"]["content"] or "").strip()
 
 
-def lmstudio_classify_content(
-    base_url: str,
-    model: str,
-    transcript_excerpt: str,
-) -> Dict[str, Any]:
-    """
-    Ask LM Studio to classify content type. Must return strict JSON.
-    """
-    system = (
-        "You are a classifier. Output ONLY valid JSON. No prose. No markdown. No <think>. "
-        "If unsure, choose the closest label."
-    )
-    user = f"""
-Classify the content type of this transcript excerpt.
-
-Return JSON with keys:
-- type: one of ["investigative_geopolitics","talkshow_daytime","podcast_interview","meeting_business","emergency_call_qa","lecture_education","other"]
-- confidence: number 0..1
-- language: short string like "tr" or "en" or "mixed"
-- rationale_short: 1 short sentence (no more than 20 words)
-
-Transcript excerpt:
-{transcript_excerpt}
-""".strip()
-
-    raw = lmstudio_chat(
-        base_url=base_url,
-        model=model,
-        system_prompt=system,
-        user_prompt=user,
-        temperature=0.0,
-        max_tokens=220,
-        timeout_s=120.0,
-    )
-    # Try parse JSON; if fails, fall back
+def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    t = text.strip()
     try:
-        return json.loads(raw)
+        return json.loads(t)
     except Exception:
-        return {
-            "type": "other",
-            "confidence": 0.2,
-            "language": "unknown",
-            "rationale_short": "Classifier output was not valid JSON.",
-        }
+        pass
+    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+    return None
 
 
-def build_summary_prompt(transcript_text: str, content_type: str) -> Tuple[str, str]:
-    """
-    Adaptive summary templates based on content type.
-    """
-    # Global guardrails to avoid chain-of-thought
-    system_guard = (
-        "IMPORTANT: Output ONLY the final answer. "
-        "Do NOT include analysis, reasoning, steps, or 'Thinking Process'. "
-        "Do NOT output <think> tags."
-    )
-
-    if content_type == "investigative_geopolitics":
-        system = (
-            system_guard
-            + "\nRole: You are an elite investigative video journalist and storyteller. "
-            "Your voice blends deep analysis, personal curiosity, and accessible explanation. "
-            "Write like a filmmaker guiding a friend through a discovery."
-        )
-        user = f"""
-Write a compelling investigative video-style summary of the transcript.
-
-Constraints:
-- No bullet points unless listing hard data.
-- Short paragraphs, voiceover-ready.
-- Use the structure: Hook → Pivot → Turns (X seems true, but actually Y) → Stakes → Conclusion.
-- Include occasional visual cues in backticks like: `Look at this map`, `Zoom in here`, `This line tells the story`.
-- Be faithful to the transcript; if something is unclear, say it’s unclear.
-- Include a short "Plot twist / reveal" moment if present.
-
-Transcript:
-{transcript_text}
-""".strip()
-        return system, user
-
-    if content_type in ("meeting_business", "emergency_call_qa"):
-        system = (
-            system_guard
-            + "\nYou are a precise operations analyst. Be concise and structured."
-        )
-        user = f"""
-Summarize the transcript for operational use. Use headings (not bullet spam).
-
-Required sections:
-1) Situation overview (1 paragraph)
-2) Key facts (short bullets allowed)
-3) Decisions / actions taken
-4) Action items (Owner if known, otherwise 'Unassigned')
-5) Risks / red flags / compliance concerns
-6) Open questions
-
-Rules:
-- Cite timestamps like [00:12:34] when helpful.
-- Do not invent details.
-
-Transcript:
-{transcript_text}
-""".strip()
-        return system, user
-
-    # Default: talkshow/podcast/other => your structured report
+def build_summary_prompt_json(transcript_text: str) -> Tuple[str, str]:
     system = (
-        system_guard
-        + "\nYou are an expert analyst. Produce clear, structured summaries with headings."
+        "Return ONLY valid JSON. No markdown, no code fences.\n"
+        'JSON keys: "final".\n'
+        '"final" must be the final report exactly in the requested format.\n'
     )
     user = f"""
-Summarize the transcript as a report with these sections:
+Write a COMPLETE structured report for the transcript below.
 
-1) Goal / thesis / hook
-2) Main arguments
-3) Evidence / examples used
-4) Conclusion / result
-5) Open questions / caveats / plot twists
-6) Lessons learned (practical)
+Return ONLY JSON.
 
-Rules:
-- Keep it clean and readable.
-- Use short bullet points where it helps.
-- If the transcript is ambiguous, say so.
-- Do not invent facts.
+The final report MUST include ALL 6 sections with these exact headings:
+1) Goal / Thesis / Hook
+2) Main Arguments
+3) Evidence / Examples
+4) Conclusion / Result
+5) Open Questions / Plot Twists
+6) Practical Lessons
+
+Rules for the FINAL report:
+- Each section must have at least 2 bullet points.
+- If something is missing, write: "Not stated in transcript."
+- If transcript contains multiple distinct stories, separate them inside the bullets (Case A/B/C).
+- Be faithful to the transcript. Do not invent facts.
 
 Transcript:
 {transcript_text}
@@ -586,32 +496,29 @@ Transcript:
     return system, user
 
 
-def build_qa_prompt(transcript_text: str, question: str) -> Tuple[str, str]:
+def build_custom_prompt_json(
+    transcript_text: str, custom_prompt: str
+) -> Tuple[str, str]:
     system = (
-        "IMPORTANT: Output ONLY the final answer. Do NOT include analysis, reasoning, or <think>.\n"
-        "You answer questions about a transcript. When relevant, cite timestamps like [00:12:34]. "
-        "If you are not confident, say so and explain what would be needed."
+        "Return ONLY valid JSON. No markdown, no code fences.\n"
+        'JSON keys: "final".\n'
+        '"final" must be the final answer only.\n'
+        "Do NOT include chain-of-thought, steps, or analysis.\n"
+        "If relevant, cite timestamps like [00:12:34].\n"
     )
     user = f"""
+Custom prompt:
+{custom_prompt}
+
 Transcript:
 {transcript_text}
-
-User question:
-{question}
 """.strip()
     return system, user
 
 
-# -----------------------------
-# Transcript packing for LLM (keeps it smaller)
-# -----------------------------
 def build_transcript_for_ai(
     segments: List[Dict[str, Any]], max_chars: int = 180_000
 ) -> str:
-    """
-    Build a timestamped transcript string for the LLM with a crude size cap.
-    Prefers readability and citations over raw verbosity.
-    """
     lines: List[str] = []
     total = 0
     for s in segments:
@@ -630,21 +537,12 @@ def build_transcript_for_ai(
     return "\n".join(lines)
 
 
-def build_excerpt_for_classification(
-    segments: List[Dict[str, Any]], max_chars: int = 6000
-) -> str:
-    """
-    Short excerpt for classification: first ~N chars.
-    """
-    return build_transcript_for_ai(segments, max_chars=max_chars)
-
-
 # -----------------------------
 # Main
 # -----------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="✨ WhisperX Best CLI: YouTube/local → outputs/<title>/ with SRT + diarization + optional LM Studio summary/Q&A"
+        description="✨ Frugan: YouTube/local → outputs/<title>/ with SRT + diarization + optional LM Studio summary + optional custom prompt"
     )
     parser.add_argument("-i", "--input", help="Input file path OR YouTube URL")
     parser.add_argument(
@@ -666,9 +564,7 @@ def main() -> int:
     )
     parser.add_argument("--lang", default=None, help="auto|tr|en|mix")
 
-    parser.add_argument(
-        "--diarize", action="store_true", help="Enable diarization (Speaker 1/2)"
-    )
+    parser.add_argument("--diarize", action="store_true", help="Enable diarization")
     parser.add_argument(
         "--hf-token", default=None, help="HF token (prefer .env or env var)"
     )
@@ -676,56 +572,47 @@ def main() -> int:
     parser.add_argument("--max-speakers", type=int, default=None)
 
     parser.add_argument(
-        "--merge-gap",
-        type=float,
-        default=0.6,
-        help="Merge gap in seconds (default 0.6)",
+        "--merge-gap", type=float, default=0.6, help="Merge gap seconds (default 0.6)"
     )
     parser.add_argument("--quiet", action="store_true", help="Hide noisy warnings/logs")
     parser.add_argument(
         "--non-interactive", action="store_true", help="No prompts, use defaults/flags"
     )
 
-    # LM Studio options (optional)
+    # LM Studio
     parser.add_argument(
-        "--lmstudio",
-        action="store_true",
-        help="Enable LM Studio features (summary + optional Q&A)",
+        "--lmstudio", action="store_true", help="Enable LM Studio outputs"
     )
     parser.add_argument(
         "--lmstudio-url", default="http://localhost:1234", help="LM Studio base URL"
     )
     parser.add_argument(
-        "--lmstudio-model", default="local-model", help="LM Studio model name"
+        "--lmstudio-model",
+        default="local-model",
+        help="LM Studio model name (auto-picks if invalid)",
     )
     parser.add_argument(
-        "--summary",
+        "--summary", action="store_true", help="Generate summary.txt via LM Studio"
+    )
+
+    # Optional custom prompt -> lm_answer.txt (+ optional lm_prompt.txt)
+    parser.add_argument(
+        "--ask", action="store_true", help="Run a custom prompt and save lm_answer.txt"
+    )
+    parser.add_argument(
+        "--prompt", default=None, help="Custom prompt text (used if --ask)."
+    )
+    parser.add_argument(
+        "--save-prompt",
         action="store_true",
-        help="Generate summary.txt via LM Studio (requires --lmstudio)",
+        help="Also save lm_prompt.txt (the prompt you asked).",
+    )
+
+    parser.add_argument(
+        "--lm-max-tokens", type=int, default=15000, help="LM Studio max_tokens."
     )
     parser.add_argument(
-        "--ask",
-        action="store_true",
-        help="Ask a question and save lm_answer.txt (requires --lmstudio)",
-    )
-    parser.add_argument(
-        "--question",
-        default=None,
-        help="Question text (used if --ask). If omitted, will ask interactively.",
-    )
-    parser.add_argument(
-        "--force-type",
-        default=None,
-        choices=[
-            "investigative_geopolitics",
-            "talkshow_daytime",
-            "podcast_interview",
-            "meeting_business",
-            "emergency_call_qa",
-            "lecture_education",
-            "other",
-        ],
-        help="Force content type (skips classification).",
+        "--lm-timeout", type=float, default=900.0, help="LM Studio timeout seconds."
     )
 
     args = parser.parse_args()
@@ -740,7 +627,6 @@ def main() -> int:
         console.print(str(ex))
         return 2
 
-    # Interactive input selection
     if not args.input and not args.non_interactive:
         console.print("📥 Input source?")
         console.print("  1) Local file path")
@@ -756,33 +642,28 @@ def main() -> int:
         console.print("❌ No input provided.")
         return 2
 
-    # Language + diarization prompts
     lang_mode = args.lang
     if not args.non_interactive:
         lang_mode = ask_lang_mode(lang_mode)
         if not args.diarize:
-            args.diarize = ask_yes_no(
-                "🧑‍🤝‍🧑 Do you want speaker diarization?", default_yes=False
-            )
+            args.diarize = ask_yes_no("🧑‍🤝‍🧑 Do you want speaker diarization?", False)
 
-        # LM Studio choices
         if not args.lmstudio:
             args.lmstudio = ask_yes_no(
-                "🧠 Use LM Studio for AI outputs (summary/Q&A)?", default_yes=False
+                "🧠 Use LM Studio outputs (summary/custom prompt)?", False
             )
+
         if args.lmstudio:
             if not args.summary:
-                args.summary = ask_yes_no(
-                    "📝 Generate summary report (summary.txt)?", default_yes=True
-                )
+                args.summary = ask_yes_no("📝 Generate summary.txt?", True)
             if not args.ask:
                 args.ask = ask_yes_no(
-                    "❓ Ask a question and save answer (lm_answer.txt)?",
-                    default_yes=False,
+                    "❓ Run a custom prompt and save lm_answer.txt?", False
                 )
-            if args.ask and not args.question:
-                args.question = ask("✍️ Question to ask about the video")
-
+            if args.ask and not args.prompt:
+                args.prompt = ask("✍️ Enter custom prompt")
+            if args.ask and not args.save_prompt:
+                args.save_prompt = ask_yes_no("💾 Also save lm_prompt.txt?", False)
     else:
         lang_mode = (lang_mode or "mix").lower()
 
@@ -792,7 +673,6 @@ def main() -> int:
     model_name = args.model or "large-v2"
     language = resolve_language(lang_mode)
 
-    # Deps for whisper
     try:
         import torch
         import whisperx
@@ -808,10 +688,8 @@ def main() -> int:
         device = "cpu"
         if compute_type.lower() in ("float16", "fp16"):
             compute_type = "int8"
-        if batch_size > 8:
-            batch_size = 8
+        batch_size = min(batch_size, 8)
 
-    # HF token for diarize
     hf_token = None
     if args.diarize:
         hf_token = get_hf_token(args.hf_token)
@@ -833,7 +711,7 @@ def main() -> int:
 
     console.print(
         Panel.fit(
-            "🚀 WhisperX Best CLI",
+            "🚀 Frugan",
             subtitle="YouTube/local → outputs/<title>/",
             style="bold cyan",
         )
@@ -843,7 +721,7 @@ def main() -> int:
     downloaded_path: Optional[Path] = None
 
     with progress:
-        # 1) Resolve input path
+        # Resolve input path
         if input_is_url:
             downloaded_path = download_youtube_with_progress(
                 args.input,
@@ -859,7 +737,7 @@ def main() -> int:
                 console.print(f"❌ File not found: {in_path}")
                 return 2
 
-        # 2) Create output folder outputs/<title>/
+        # Output folder
         out_dir = output_dir_for_input(in_path)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -872,19 +750,18 @@ def main() -> int:
                 progress.update(t, completed=100)
             video_path = target_video
         else:
-            video_path = in_path  # keep original path
+            video_path = in_path
 
-        # 3) Output files
+        # Output files
         srt_path = out_dir / "transcript.srt"
         srt_speakers_path = out_dir / "transcript.speakers.srt"
         txt_path = out_dir / "transcript.txt"
         summary_path = out_dir / "summary.txt"
         answer_path = out_dir / "lm_answer.txt"
-        meta_path = out_dir / "metadata.json"
-        type_path = out_dir / "content_type.json"
+        prompt_path = out_dir / "lm_prompt.txt"
 
-        # 4) Extract wav to temp
-        tmp_dir = Path(tempfile.mkdtemp(prefix="whisperx_"))
+        # Temp audio
+        tmp_dir = Path(tempfile.mkdtemp(prefix="frugan_"))
         wav_path = tmp_dir / "audio.wav"
 
         detected = None
@@ -897,12 +774,13 @@ def main() -> int:
             progress.update(t, completed=100)
 
             t = progress.add_task("🧠 Loading ASR model", total=100)
-            model = whisperx.load_model(
-                model_name,
-                device,
-                compute_type=compute_type,
-                vad_method=args.vad,
-            )
+            with suppress_stderr(args.quiet):
+                model = whisperx.load_model(
+                    model_name,
+                    device,
+                    compute_type=compute_type,
+                    vad_method=args.vad,
+                )
             progress.update(t, completed=100)
 
             t = progress.add_task("✍️ Transcribing", total=100)
@@ -914,17 +792,18 @@ def main() -> int:
             console.print(f"🗣️ Language detected/used: [bold]{detected}[/bold]")
 
             t = progress.add_task("📍 Aligning timestamps", total=100)
-            model_a, metadata = whisperx.load_align_model(
-                language_code=detected, device=device
-            )
-            aligned = whisperx.align(
-                result["segments"],
-                model_a,
-                metadata,
-                audio,
-                device,
-                return_char_alignments=False,
-            )
+            with suppress_stderr(args.quiet):
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=detected, device=device
+                )
+                aligned = whisperx.align(
+                    result["segments"],
+                    model_a,
+                    metadata,
+                    audio,
+                    device,
+                    return_char_alignments=False,
+                )
             progress.update(t, completed=100)
 
             base_segments = merge_consecutive_segments(
@@ -942,15 +821,21 @@ def main() -> int:
                 t = progress.add_task("🧑‍🤝‍🧑 Diarizing speakers", total=100)
                 from whisperx.diarize import DiarizationPipeline
 
-                diar = DiarizationPipeline(token=hf_token, device=device)
-                diar_kwargs = {}
+                with suppress_stderr(args.quiet):
+                    diar = DiarizationPipeline(token=hf_token, device=device)
+
+                diar_kwargs: Dict[str, Any] = {}
                 if args.min_speakers is not None:
                     diar_kwargs["min_speakers"] = args.min_speakers
                 if args.max_speakers is not None:
                     diar_kwargs["max_speakers"] = args.max_speakers
 
-                diar_segs = diar(audio, **diar_kwargs) if diar_kwargs else diar(audio)
-                with_spk = whisperx.assign_word_speakers(diar_segs, aligned)
+                with suppress_stderr(args.quiet):
+                    diar_segs = (
+                        diar(audio, **diar_kwargs) if diar_kwargs else diar(audio)
+                    )
+                    with_spk = whisperx.assign_word_speakers(diar_segs, aligned)
+
                 progress.update(t, completed=100)
 
                 spk_segments = merge_consecutive_segments(
@@ -961,110 +846,91 @@ def main() -> int:
                 write_srt(spk_segments, srt_speakers_path, speaker_prefix=True)
                 progress.update(t, completed=100)
 
-            # metadata.json
-            meta = {
-                "input": args.input,
-                "video_path": str(video_path),
-                "output_dir": str(out_dir),
-                "model": model_name,
-                "device": device,
-                "compute_type": compute_type,
-                "batch_size": batch_size,
-                "vad": args.vad,
-                "lang_mode": lang_mode,
-                "detected_language": detected,
-                "diarize": bool(args.diarize),
-                "merge_gap": args.merge_gap,
-                "lmstudio_enabled": bool(args.lmstudio),
-                "lmstudio_url": args.lmstudio_url if args.lmstudio else None,
-                "lmstudio_model": args.lmstudio_model if args.lmstudio else None,
-                "force_type": args.force_type,
-            }
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-            # LM Studio outputs (optional)
+            # LM Studio outputs
             if args.lmstudio and (args.summary or args.ask):
                 if not lmstudio_is_up(args.lmstudio_url):
                     console.print(
-                        "⚠️ LM Studio server not reachable. Skipping AI outputs (no crash)."
+                        "⚠️ LM Studio server not reachable. Skipping LM outputs."
                     )
                 else:
-                    # Build transcript for AI (prefer speaker segments)
-                    use_segments = spk_segments if spk_segments else base_segments
-                    transcript_for_ai = build_transcript_for_ai(use_segments)
-
-                    # Determine content type
-                    content_type_info: Dict[str, Any]
-                    if args.force_type:
-                        content_type_info = {
-                            "type": args.force_type,
-                            "confidence": 1.0,
-                            "language": detected or "unknown",
-                            "rationale_short": "Forced by user.",
-                        }
-                    else:
-                        excerpt = build_excerpt_for_classification(use_segments)
-                        t = progress.add_task(
-                            "🧭 LM Studio: detecting content type", total=100
-                        )
-                        content_type_info = lmstudio_classify_content(
-                            base_url=args.lmstudio_url,
-                            model=args.lmstudio_model,
-                            transcript_excerpt=excerpt,
-                        )
-                        progress.update(t, completed=100)
-
-                    type_path.write_text(
-                        json.dumps(content_type_info, indent=2), encoding="utf-8"
+                    args.lmstudio_model = lmstudio_pick_model(
+                        args.lmstudio_url, args.lmstudio_model
+                    )
+                    console.print(
+                        f"🧠 LM Studio model: [bold]{args.lmstudio_model}[/bold]"
                     )
 
-                    ctype = str(content_type_info.get("type") or "other")
+                    use_segments = spk_segments if spk_segments else base_segments
+                    transcript_for_ai = build_transcript_for_ai(use_segments)
 
                     if args.summary:
                         t = progress.add_task(
                             "📝 LM Studio: generating summary.txt", total=100
                         )
-                        sys_p, usr_p = build_summary_prompt(transcript_for_ai, ctype)
+                        raw = ""
                         try:
-                            summary = lmstudio_chat(
+                            sys_p, usr_p = build_summary_prompt_json(transcript_for_ai)
+                            raw = lmstudio_chat_raw(
                                 base_url=args.lmstudio_url,
                                 model=args.lmstudio_model,
                                 system_prompt=sys_p,
                                 user_prompt=usr_p,
                                 temperature=0.2,
-                                max_tokens=1600,
-                                timeout_s=900.0,
+                                max_tokens=args.lm_max_tokens,
+                                timeout_s=args.lm_timeout,
                             )
-                            summary_path.write_text(summary, encoding="utf-8")
+                            obj = try_parse_json(raw)
+                            if obj and isinstance(obj, dict):
+                                final = str(obj.get("final") or "").strip()
+                                summary_path.write_text(
+                                    final if final else raw.strip(), encoding="utf-8"
+                                )
+                            else:
+                                summary_path.write_text(raw.strip(), encoding="utf-8")
                         except Exception as ex:
                             summary_path.write_text(
-                                f"LM Studio summary failed:\n{ex}", encoding="utf-8"
+                                f"LM Studio summary failed:\n{type(ex).__name__}: {ex}\n\nRaw:\n{raw}",
+                                encoding="utf-8",
                             )
                         progress.update(t, completed=100)
 
-                    if args.ask:
-                        q = (args.question or "").strip()
-                        if q:
-                            t = progress.add_task(
-                                "❓ LM Studio: answering question", total=100
+                    if args.ask and (args.prompt or "").strip():
+                        if args.save_prompt:
+                            prompt_path.write_text(
+                                args.prompt.strip(), encoding="utf-8"
                             )
-                            sys_p, usr_p = build_qa_prompt(transcript_for_ai, q)
-                            try:
-                                ans = lmstudio_chat(
-                                    base_url=args.lmstudio_url,
-                                    model=args.lmstudio_model,
-                                    system_prompt=sys_p,
-                                    user_prompt=usr_p,
-                                    temperature=0.2,
-                                    max_tokens=1200,
-                                    timeout_s=600.0,
-                                )
-                                answer_path.write_text(ans, encoding="utf-8")
-                            except Exception as ex:
+
+                        t = progress.add_task(
+                            "❓ LM Studio: running custom prompt", total=100
+                        )
+                        raw = ""
+                        try:
+                            sys_p, usr_p = build_custom_prompt_json(
+                                transcript_for_ai, args.prompt.strip()
+                            )
+                            raw = lmstudio_chat_raw(
+                                base_url=args.lmstudio_url,
+                                model=args.lmstudio_model,
+                                system_prompt=sys_p,
+                                user_prompt=usr_p,
+                                temperature=0.2,
+                                max_tokens=min(args.lm_max_tokens, 15000),
+                                timeout_s=max(120.0, min(args.lm_timeout, 900.0)),
+                            )
+                            obj = try_parse_json(raw)
+                            if obj and isinstance(obj, dict):
+                                final = str(obj.get("final") or "").strip()
                                 answer_path.write_text(
-                                    f"LM Studio Q&A failed:\n{ex}", encoding="utf-8"
+                                    final if final else raw.strip(), encoding="utf-8"
                                 )
-                            progress.update(t, completed=100)
+                            else:
+                                answer_path.write_text(raw.strip(), encoding="utf-8")
+                        except Exception as ex:
+                            answer_path.write_text(
+                                f"LM Studio custom prompt failed:\n{type(ex).__name__}: {ex}\n\nRaw:\n{raw}",
+                                encoding="utf-8",
+                            )
+                        progress.update(t, completed=100)
 
         finally:
             try:
@@ -1085,7 +951,6 @@ def main() -> int:
         except Exception:
             pass
 
-    # End-of-run summary
     console.print(f"✅ Output folder: [bold]{out_dir}[/bold]")
     console.print(f"✅ transcript.srt: {srt_path}")
     if args.diarize:
@@ -1093,9 +958,10 @@ def main() -> int:
     console.print(f"✅ transcript.txt: {txt_path}")
     if args.lmstudio and args.summary:
         console.print(f"✅ summary.txt: {summary_path}")
-        console.print(f"✅ content_type.json: {type_path}")
-    if args.lmstudio and args.ask and args.question:
+    if args.lmstudio and args.ask and (args.prompt or "").strip():
         console.print(f"✅ lm_answer.txt: {answer_path}")
+        if args.save_prompt:
+            console.print(f"✅ lm_prompt.txt: {prompt_path}")
 
     return 0
 
