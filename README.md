@@ -1,5 +1,5 @@
 
-<h1 align="center">Frugan</h1>
+<h1 align="center">Frugis</h1>
 
 <p align="center">
   Turns video/audio into transcripts, separates speakers by diarization and uses local LLM to summarize the transcript. Also has option prompting.
